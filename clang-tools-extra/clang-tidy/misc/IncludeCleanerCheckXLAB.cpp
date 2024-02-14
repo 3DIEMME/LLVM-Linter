@@ -42,6 +42,7 @@
 #include <optional>
 #include <string>
 #include <vector>
+#include <clang/AST/RecursiveASTVisitor.h>
 
 using namespace clang::ast_matchers;
 
@@ -126,7 +127,7 @@ namespace clang::tidy::misc {
             }
             return StringRef{};
         };
-        auto res =  llvm::any_of(IgnoreHeadersRegex, [&H](const llvm::Regex&R) {
+        auto res = llvm::any_of(IgnoreHeadersRegex, [&H](const llvm::Regex&R) {
             switch (H.kind()) {
                 case include_cleaner::Header::Standard:
                     // We don't trim angle brackets around standard library headers
@@ -161,7 +162,7 @@ namespace clang::tidy::misc {
             return StringRef{};
         };
 
-        auto res =  llvm::any_of(OnlySpecificHeadersRegex, [&H](const llvm::Regex&R) {
+        auto res = llvm::any_of(OnlySpecificHeadersRegex, [&H](const llvm::Regex&R) {
             switch (H.kind()) {
                 case include_cleaner::Header::Standard:
                     // We don't trim angle brackets around standard library headers
@@ -191,15 +192,105 @@ namespace clang::tidy::misc {
             // FIXME: Filter out implicit template specializations.
             MainFileDecls.push_back(D);
         }
+
+        class MemberExprVisitor : public RecursiveASTVisitor<MemberExprVisitor> {
+        public:
+            explicit MemberExprVisitor(ASTContext* context, llvm::SmallVector<Decl *>&VEC)
+                : MainFileDecls(VEC), Context(context), SM(Context->getSourceManager()) {
+            }
+
+            bool VisitMemberExpr(MemberExpr* ME) {
+                if (!SM.isWrittenInMainFile(ME->getExprLoc())) {
+                    return true;
+                }
+                // llvm::outs() << "Found MemberExpr: " << ME->getSourceRange().printToString(Context->getSourceManager()) << '\n';
+                // Handle the current MemberExpr
+                if (ValueDecl* VD = ME->getMemberDecl()) {
+                    // llvm::outs() << "Found ValueDecl: " << VD->getSourceRange().printToString(Context->getSourceManager()) << '\n';
+                    MainFileDecls.push_back(dyn_cast<Decl>(VD));
+                }
+
+                // Recursively visit the base of the MemberExpr
+                // if (auto *Base = dyn_cast<MemberExpr>(ME->getBase())) {
+                //     VisitMemberExpr(Base);
+                // }
+
+                return true;
+            }
+
+            clang::Decl* extractType(clang::CXXMemberCallExpr* callExpr) {
+                llvm::outs() << "Found callExpr: " << callExpr->getSourceRange().printToString(Context->getSourceManager()) << '\n';
+                if (!callExpr) return nullptr;
+                //llvm::outs() << "HERE 1 \n";
+                Expr *objectExpr = callExpr->getImplicitObjectArgument();
+                if (objectExpr) {
+                    //llvm::outs() << "HERE 2 \n";
+                    objectExpr = objectExpr->IgnoreParenImpCasts(); // Clean up the expression
+                    //objectExpr->dump(llvm::outs(), *Context);
+                    llvm::outs() << "Found objectExpr: " << objectExpr->getSourceRange().printToString(Context->getSourceManager()) << '\n';
+                    if (DeclRefExpr *declRef = dyn_cast<DeclRefExpr>(objectExpr)) {
+                        // If the object expression is a reference to a declaration, get that declaration
+                        ValueDecl *objectDecl = declRef->getDecl();
+                        llvm::outs() << "Found objectDecl: " << objectDecl->getSourceRange().printToString(Context->getSourceManager()) << '\n';
+                        return objectDecl;
+                        // Now objectDecl points to the declaration of the object
+                    } else if (MemberExpr *memberExpr = dyn_cast<MemberExpr>(objectExpr)) {
+                        // If the object expression is a member of another object, get that member's declaration
+                        ValueDecl *memberDecl = memberExpr->getMemberDecl();
+                        llvm::outs() << "Found member decl: " << memberDecl->getSourceRange().printToString(Context->getSourceManager()) << '\n';
+                        return memberDecl;
+                        // memberDecl now points to the declaration of the member
+                    } else if (CallExpr* callExpr = dyn_cast<CallExpr>(objectExpr)) {
+                        // If the object expression is a member of another object, get that member's declaration
+                        auto *decl = callExpr->getCalleeDecl();
+                        auto *callee = callExpr->getCallee();
+                        llvm::outs() << "Found call decl: " << decl->getSourceRange().printToString(Context->getSourceManager()) << '\n';
+                        return decl;
+                    }
+                    // Additional cases can be handled similarly depending on the types of expressions you expect
+                }
+
+                return nullptr;
+            }
+
+            bool VisitCXXMemberCallExpr(CXXMemberCallExpr* MCE) {
+                if (!SM.isWrittenInMainFile(MCE->getExprLoc())) {
+                    return true;
+                }
+                if (auto* Decl = extractType(MCE)) {
+                    MainFileDecls.push_back(Decl);
+                }
+
+                return true;
+            }
+
+        private:
+            llvm::SmallVector<Decl *>&MainFileDecls;
+            ASTContext* Context;
+            SourceManager&SM;
+        };
+        MemberExprVisitor visitor(Result.Context, MainFileDecls);
+        visitor.TraverseDecl(Result.Context->getTranslationUnitDecl());
+        // llvm::outs() << "Result: " << res << '\n';
+
         llvm::DenseSet<include_cleaner::Symbol> SeenSymbols;
         OptionalDirectoryEntryRef ResourceDir =
                 PP->getHeaderSearchInfo().getModuleMap().getBuiltinDir();
+
+        // llvm::outs() << "Found declarations: \n";
+        // for(const auto d : MainFileDecls) {
+        //     llvm::outs() << d->getLocation().printToString(Result.Context->getSourceManager()) << '\n';
+        // }
+
         // FIXME: Find a way to have less code duplication between include-cleaner
         // analysis implementation and the below code.
         walkUsed(MainFileDecls, RecordedPreprocessor.MacroReferences, &RecordedPI,
                  *PP,
                  [&](const include_cleaner::SymbolReference&Ref,
                      llvm::ArrayRef<include_cleaner::Header> Providers) {
+                     // llvm::outs() << Ref.RefLocation.printToString(Result.Context->getSourceManager()) << '\n';
+
+
                      // Process each symbol once to reduce noise in the findings.
                      // Tidy checks are used in two different workflows:
                      // - Ones that show all the findings for a given file. For such
@@ -213,6 +304,7 @@ namespace clang::tidy::misc {
                      // dependency did not exist in the code at all before).
                      if (DeduplicateFindings && !SeenSymbols.insert(Ref.Target).second)
                          return;
+                     // llvm::outs() << "Continue...\n";
                      bool Satisfied = false;
                      for (const include_cleaner::Header&H: Providers) {
                          if (H.kind() == include_cleaner::Header::Physical &&
@@ -228,11 +320,16 @@ namespace clang::tidy::misc {
                              Satisfied = true;
                          }
                      }
+                     // auto rt = Ref.RT == include_cleaner::RefType::Explicit ? "Explicit" : (Ref.RT == include_cleaner::RefType::Implicit ? "Implicit" : "Ambiguous");
+                     // llvm::outs() << "Satisfied " << Satisfied << " !Providers.empty() " << Providers.empty() << " RefType " << rt << '\n';
+
                      if (!Satisfied && !Providers.empty() &&
-                         Ref.RT == include_cleaner::RefType::Explicit &&
+                         Ref.RT != include_cleaner::RefType::Ambiguous &&
                          !shouldIgnore(Providers.front()) &&
-                         shouldInclude(Providers.front()))
+                         shouldInclude(Providers.front())) {
+                         // llvm::outs() << "MISSING!\n";
                          Missing.push_back({Ref, Providers.front()});
+                     }
                  });
 
         std::vector<const include_cleaner::Include *> Unused;
