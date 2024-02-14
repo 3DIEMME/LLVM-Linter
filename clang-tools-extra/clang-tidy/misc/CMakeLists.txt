@@ -23,6 +23,7 @@ add_clang_library(clangTidyMiscModule
   ConfusableIdentifierCheck.cpp
   HeaderIncludeCycleCheck.cpp
   IncludeCleanerCheck.cpp
+  IncludeCleanerCheckXLAB.cpp
   MiscTidyModule.cpp
   MisleadingBidirectional.cpp
   MisleadingIdentifier.cpp
