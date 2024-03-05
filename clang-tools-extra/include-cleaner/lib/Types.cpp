@@ -91,6 +91,8 @@ llvm::raw_ostream &operator<<(llvm::raw_ostream &OS, RefType T) {
     return OS << "implicit";
   case RefType::Ambiguous:
     return OS << "ambiguous";
+  case RefType::Forced:
+    return OS << "forced";
   }
   llvm_unreachable("Unexpected RefType");
 }

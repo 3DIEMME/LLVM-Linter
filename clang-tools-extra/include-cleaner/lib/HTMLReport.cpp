@@ -126,6 +126,8 @@ llvm::StringRef refType(RefType T) {
     return "implicit";
   case RefType::Ambiguous:
     return "ambiguous";
+  case RefType::Forced:
+    return "forced";
   }
   llvm_unreachable("unhandled RefType enum");
 }

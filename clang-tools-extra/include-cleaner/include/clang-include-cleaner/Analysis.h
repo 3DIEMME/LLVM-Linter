@@ -60,6 +60,11 @@ void walkUsed(llvm::ArrayRef<Decl *> ASTRoots,
               const PragmaIncludes *PI, const Preprocessor &PP,
               UsedSymbolCB CB);
 
+void walkUsedForced(llvm::ArrayRef<std::pair<Decl *, SourceLocation>> ASTRoots,
+                    llvm::ArrayRef<SymbolReference> MacroRefs,
+                    const PragmaIncludes* PI, const Preprocessor&PP,
+                    UsedSymbolCB CB);
+
 struct AnalysisResults {
   std::vector<const Include *> Unused;
   std::vector<std::string> Missing; // Spellings, like "<vector>"

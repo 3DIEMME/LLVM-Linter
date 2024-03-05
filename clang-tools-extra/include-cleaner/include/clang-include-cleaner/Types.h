@@ -95,6 +95,8 @@ enum class RefType {
   Implicit,
   /// Target's use can't be proven, e.g. a candidate for an unresolved overload.
   Ambiguous,
+  /// Target is forced
+  Forced
 };
 llvm::raw_ostream &operator<<(llvm::raw_ostream &, RefType);
 

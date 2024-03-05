@@ -76,6 +76,18 @@ void walkUsed(llvm::ArrayRef<Decl *> ASTRoots,
   }
 }
 
+void walkUsedForced(llvm::ArrayRef<std::pair<Decl *, SourceLocation>> ASTRoots,
+              llvm::ArrayRef<SymbolReference> MacroRefs,
+              const PragmaIncludes *PI, const Preprocessor &PP,
+              UsedSymbolCB CB) {
+  const auto &SM = PP.getSourceManager();
+  // This is duplicated in writeHTMLReport, changes should be mirrored there.
+  tooling::stdlib::Recognizer Recognizer;
+  for (auto&& [Root, Loc] : ASTRoots) {
+    CB(SymbolReference{*Root, Loc, RefType::Forced}, headersForSymbol(*Root, SM, PI));
+  }
+}
+
 AnalysisResults
 analyze(llvm::ArrayRef<Decl *> ASTRoots,
         llvm::ArrayRef<SymbolReference> MacroRefs, const Includes &Inc,

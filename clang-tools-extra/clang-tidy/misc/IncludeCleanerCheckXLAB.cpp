@@ -1,4 +1,5 @@
-//===--- IncludeCleanerCheckXLAB.cpp - clang-tidy -----------------------------===//
+//===--- IncludeCleanerCheckXLAB.cpp - clang-tidy
+//-----------------------------===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -18,6 +19,7 @@
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/Decl.h"
 #include "clang/AST/DeclBase.h"
+#include "clang/AST/ExprCXX.h"
 #include "clang/ASTMatchers/ASTMatchFinder.h"
 #include "clang/ASTMatchers/ASTMatchers.h"
 #include "clang/Basic/Diagnostic.h"
@@ -39,10 +41,10 @@
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/Regex.h"
+#include <clang/AST/RecursiveASTVisitor.h>
 #include <optional>
 #include <string>
 #include <vector>
-#include <clang/AST/RecursiveASTVisitor.h>
 
 using namespace clang::ast_matchers;
 
@@ -63,10 +65,8 @@ namespace clang::tidy::misc {
               Options.getLocalOrGlobal("OnlySpecificHeaders", ""))),
           DeduplicateFindings(
               Options.getLocalOrGlobal("DeduplicateFindings", true)),
-          SkipRemove(
-              Options.getLocalOrGlobal("SkipRemove", false)),
-          SkipInsert(
-              Options.getLocalOrGlobal("SkipInsert", false)),
+          SkipRemove(Options.getLocalOrGlobal("SkipRemove", false)),
+          SkipInsert(Options.getLocalOrGlobal("SkipInsert", false)),
           EnableOnlySpecificHeaders(
               Options.getLocalOrGlobal("EnableOnlySpecificHeaders", false)) {
         for (const auto&Header: IgnoreHeaders) {
@@ -104,12 +104,20 @@ namespace clang::tidy::misc {
     }
 
     void IncludeCleanerCheckXLAB::registerMatchers(MatchFinder* Finder) {
+        // Loop through all declarations in main TU
         Finder->addMatcher(translationUnitDecl().bind("top"), this);
+
+        // Find all VTK pointer dereferences
+        Finder->addMatcher(
+            cxxMemberCallExpr(
+                on(has(declRefExpr(to(cxxMethodDecl(ofClass(
+                    allOf(isDerivedFrom("vtkObjectBase"), unless(isImplicit())))))))))
+            .bind("vtkObjectBaseCall"),
+            this);
     }
 
-    void IncludeCleanerCheckXLAB::registerPPCallbacks(const SourceManager&SM,
-                                                      Preprocessor* PP,
-                                                      Preprocessor* ModuleExpanderPP) {
+    void IncludeCleanerCheckXLAB::registerPPCallbacks(
+        const SourceManager&SM, Preprocessor* PP, Preprocessor* ModuleExpanderPP) {
         PP->addPPCallbacks(RecordedPreprocessor.record(*PP));
         this->PP = PP;
         RecordedPI.record(*PP);
@@ -186,6 +194,7 @@ namespace clang::tidy::misc {
         llvm::DenseSet<const include_cleaner::Include *> Used;
         std::vector<MissingIncludeInfo> Missing;
         llvm::SmallVector<Decl *> MainFileDecls;
+        llvm::SmallVector<std::pair<Decl*, SourceLocation>> ForcedDecls;
         for (Decl* D: Result.Nodes.getNodeAs<TranslationUnitDecl>("top")->decls()) {
             if (!SM->isWrittenInMainFile(SM->getExpansionLoc(D->getLocation())))
                 continue;
@@ -195,81 +204,48 @@ namespace clang::tidy::misc {
 
         class MemberExprVisitor : public RecursiveASTVisitor<MemberExprVisitor> {
         public:
-            explicit MemberExprVisitor(ASTContext* context, llvm::SmallVector<Decl *>&VEC)
-                : MainFileDecls(VEC), Context(context), SM(Context->getSourceManager()) {
+            explicit MemberExprVisitor(ASTContext* context,
+                                       llvm::SmallVector<Decl *>&VEC, llvm::SmallVector<std::pair<Decl*, SourceLocation>>&VEC2)
+                : MainFileDecls(VEC), ForcedDecls(VEC2), Context(context),
+                  SM(Context->getSourceManager()) {
             }
 
-            bool VisitMemberExpr(MemberExpr* ME) {
-                if (!SM.isWrittenInMainFile(ME->getExprLoc())) {
+            bool VisitCXXMemberCallExpr(CXXMemberCallExpr* Call) {
+                if (!SM.isWrittenInMainFile(Call->getExprLoc())) {
                     return true;
                 }
-                // llvm::outs() << "Found MemberExpr: " << ME->getSourceRange().printToString(Context->getSourceManager()) << '\n';
-                // Handle the current MemberExpr
-                if (ValueDecl* VD = ME->getMemberDecl()) {
-                    // llvm::outs() << "Found ValueDecl: " << VD->getSourceRange().printToString(Context->getSourceManager()) << '\n';
-                    MainFileDecls.push_back(dyn_cast<Decl>(VD));
-                }
-
-                // Recursively visit the base of the MemberExpr
-                // if (auto *Base = dyn_cast<MemberExpr>(ME->getBase())) {
-                //     VisitMemberExpr(Base);
-                // }
-
-                return true;
-            }
-
-            clang::Decl* extractType(clang::CXXMemberCallExpr* callExpr) {
-                llvm::outs() << "Found callExpr: " << callExpr->getSourceRange().printToString(Context->getSourceManager()) << '\n';
-                if (!callExpr) return nullptr;
-                //llvm::outs() << "HERE 1 \n";
-                Expr *objectExpr = callExpr->getImplicitObjectArgument();
-                if (objectExpr) {
-                    //llvm::outs() << "HERE 2 \n";
-                    objectExpr = objectExpr->IgnoreParenImpCasts(); // Clean up the expression
-                    //objectExpr->dump(llvm::outs(), *Context);
-                    llvm::outs() << "Found objectExpr: " << objectExpr->getSourceRange().printToString(Context->getSourceManager()) << '\n';
-                    if (DeclRefExpr *declRef = dyn_cast<DeclRefExpr>(objectExpr)) {
-                        // If the object expression is a reference to a declaration, get that declaration
-                        ValueDecl *objectDecl = declRef->getDecl();
-                        llvm::outs() << "Found objectDecl: " << objectDecl->getSourceRange().printToString(Context->getSourceManager()) << '\n';
-                        return objectDecl;
-                        // Now objectDecl points to the declaration of the object
-                    } else if (MemberExpr *memberExpr = dyn_cast<MemberExpr>(objectExpr)) {
-                        // If the object expression is a member of another object, get that member's declaration
-                        ValueDecl *memberDecl = memberExpr->getMemberDecl();
-                        llvm::outs() << "Found member decl: " << memberDecl->getSourceRange().printToString(Context->getSourceManager()) << '\n';
-                        return memberDecl;
-                        // memberDecl now points to the declaration of the member
-                    } else if (CallExpr* callExpr = dyn_cast<CallExpr>(objectExpr)) {
-                        // If the object expression is a member of another object, get that member's declaration
-                        auto *decl = callExpr->getCalleeDecl();
-                        auto *callee = callExpr->getCallee();
-                        llvm::outs() << "Found call decl: " << decl->getSourceRange().printToString(Context->getSourceManager()) << '\n';
-                        return decl;
+                CXXMethodDecl* MethodDecl = Call->getMethodDecl();
+                //llvm::outs() << "MethodDecl: " << MethodDecl->getName() << '\n';
+                if (MethodDecl) {
+                    CXXRecordDecl* ClassDecl = MethodDecl->getParent();
+                    //llvm::outs() << "ClassDecl: " << ClassDecl->getName() << '\n';
+                    if (ClassDecl) {
+                        // Check if the class is derived from vtkObjectBase.
+                        for (auto BaseSpecifier: ClassDecl->bases()) {
+                            CXXRecordDecl* BaseClassDecl = BaseSpecifier.getType()->getAsCXXRecordDecl();
+                            //llvm::outs() << "BaseClassDecl: " << BaseClassDecl->getName() << '\n';
+                            if (BaseClassDecl) {
+                                if (BaseClassDecl->getQualifiedNameAsString() ==
+                                    "vtkObjectBase") {
+                                    // llvm::outs() << "Found vtkObjectBase kind: " << ClassDecl->getName() << " " <<
+                                    //         ClassDecl->getLocation().printToString(SM) << '\n';
+                                    ForcedDecls.push_back({ClassDecl, Call->getExprLoc()});
+                                }
+                            }
+                        }
                     }
-                    // Additional cases can be handled similarly depending on the types of expressions you expect
                 }
-
-                return nullptr;
-            }
-
-            bool VisitCXXMemberCallExpr(CXXMemberCallExpr* MCE) {
-                if (!SM.isWrittenInMainFile(MCE->getExprLoc())) {
-                    return true;
-                }
-                if (auto* Decl = extractType(MCE)) {
-                    MainFileDecls.push_back(Decl);
-                }
-
                 return true;
             }
 
         private:
             llvm::SmallVector<Decl *>&MainFileDecls;
+            llvm::SmallVector<std::pair<Decl*, SourceLocation>>&ForcedDecls;
+
             ASTContext* Context;
             SourceManager&SM;
         };
-        MemberExprVisitor visitor(Result.Context, MainFileDecls);
+        MemberExprVisitor visitor(Result.Context, MainFileDecls, ForcedDecls);
         visitor.TraverseDecl(Result.Context->getTranslationUnitDecl());
         // llvm::outs() << "Result: " << res << '\n';
 
@@ -279,57 +255,55 @@ namespace clang::tidy::misc {
 
         // llvm::outs() << "Found declarations: \n";
         // for(const auto d : MainFileDecls) {
-        //     llvm::outs() << d->getLocation().printToString(Result.Context->getSourceManager()) << '\n';
+        //     llvm::outs() <<
+        //     d->getLocation().printToString(Result.Context->getSourceManager()) <<
+        //     '\n';
         // }
 
-        // FIXME: Find a way to have less code duplication between include-cleaner
-        // analysis implementation and the below code.
+        const auto pProcessDecl = [&](const include_cleaner::SymbolReference&Ref,
+                                      llvm::ArrayRef<include_cleaner::Header> Providers) {
+            if (DeduplicateFindings && !SeenSymbols.insert(Ref.Target).second)
+                return;
+            bool Satisfied = false;
+            for (const include_cleaner::Header&H: Providers) {
+                if (H.kind() == include_cleaner::Header::Physical &&
+                    (H.physical() == MainFile ||
+                     H.physical().getDir() == ResourceDir)) {
+                    Satisfied = true;
+                    continue;
+                }
+
+                for (const include_cleaner::Include* I:
+                     RecordedPreprocessor.Includes.match(H)) {
+                    Used.insert(I);
+                    Satisfied = true;
+                }
+            }
+
+            auto pTypeCheck = [&](const include_cleaner::SymbolReference&Ref) -> bool {
+                return Ref.RT == include_cleaner::RefType::Explicit || Ref.RT == include_cleaner::RefType::Forced;
+            };
+
+            if (!Satisfied && !Providers.empty() &&
+                pTypeCheck(Ref) &&
+                !shouldIgnore(Providers.front()) &&
+                shouldInclude(Providers.front())) {
+
+                Missing.push_back({Ref, Providers.front()});
+            }
+        };
+
+        walkUsedForced(ForcedDecls, RecordedPreprocessor.MacroReferences, &RecordedPI,
+                       *PP,
+                       [&](const include_cleaner::SymbolReference&Ref,
+                           llvm::ArrayRef<include_cleaner::Header> Providers) {
+                           pProcessDecl(Ref, Providers);
+                       });
         walkUsed(MainFileDecls, RecordedPreprocessor.MacroReferences, &RecordedPI,
                  *PP,
                  [&](const include_cleaner::SymbolReference&Ref,
                      llvm::ArrayRef<include_cleaner::Header> Providers) {
-                     // llvm::outs() << Ref.RefLocation.printToString(Result.Context->getSourceManager()) << '\n';
-
-
-                     // Process each symbol once to reduce noise in the findings.
-                     // Tidy checks are used in two different workflows:
-                     // - Ones that show all the findings for a given file. For such
-                     // workflows there is not much point in showing all the occurences,
-                     // as one is enough to indicate the issue.
-                     // - Ones that show only the findings on changed pieces. For such
-                     // workflows it's useful to show findings on every reference of a
-                     // symbol as otherwise tools might give incosistent results
-                     // depending on the parts of the file being edited. But it should
-                     // still help surface findings for "new violations" (i.e.
-                     // dependency did not exist in the code at all before).
-                     if (DeduplicateFindings && !SeenSymbols.insert(Ref.Target).second)
-                         return;
-                     // llvm::outs() << "Continue...\n";
-                     bool Satisfied = false;
-                     for (const include_cleaner::Header&H: Providers) {
-                         if (H.kind() == include_cleaner::Header::Physical &&
-                             (H.physical() == MainFile ||
-                              H.physical().getDir() == ResourceDir)) {
-                             Satisfied = true;
-                             continue;
-                         }
-
-                         for (const include_cleaner::Include* I:
-                              RecordedPreprocessor.Includes.match(H)) {
-                             Used.insert(I);
-                             Satisfied = true;
-                         }
-                     }
-                     // auto rt = Ref.RT == include_cleaner::RefType::Explicit ? "Explicit" : (Ref.RT == include_cleaner::RefType::Implicit ? "Implicit" : "Ambiguous");
-                     // llvm::outs() << "Satisfied " << Satisfied << " !Providers.empty() " << Providers.empty() << " RefType " << rt << '\n';
-
-                     if (!Satisfied && !Providers.empty() &&
-                         Ref.RT != include_cleaner::RefType::Ambiguous &&
-                         !shouldIgnore(Providers.front()) &&
-                         shouldInclude(Providers.front())) {
-                         // llvm::outs() << "MISSING!\n";
-                         Missing.push_back({Ref, Providers.front()});
-                     }
+                     pProcessDecl(Ref, Providers);
                  });
 
         std::vector<const include_cleaner::Include *> Unused;
@@ -367,19 +341,6 @@ namespace clang::tidy::misc {
                                  &SM->getFileManager().getVirtualFileSystem());
         if (!FileStyle)
             FileStyle = format::getLLVMStyle();
-        if (!SkipRemove) {
-            for (const auto* Inc: Unused) {
-                diag(Inc->HashLocation, "included header %0 is not used directly")
-                        << llvm::sys::path::filename(Inc->Spelled,
-                                                     llvm::sys::path::Style::posix)
-                        << FixItHint::CreateRemoval(CharSourceRange::getCharRange(
-                            SM->translateLineCol(SM->getMainFileID(), Inc->Line, 1),
-                            SM->translateLineCol(SM->getMainFileID(), Inc->Line + 1, 1)));
-            }
-        }
-        else {
-            llvm::outs() << "Skipping include cleaner header removal due to the SkipRemove\n";
-        }
 
         if (!SkipInsert) {
             tooling::HeaderIncludes HeaderIncludes(getCurrentMainFile(), Code,
@@ -412,6 +373,21 @@ namespace clang::tidy::misc {
         }
         else {
             llvm::outs() << "Skipping include cleaner header insertion due to the SkipInsert\n";
+        }
+
+        if (!SkipRemove) {
+            for (const auto* Inc: Unused) {
+                diag(Inc->HashLocation, "included header %0 is not used directly")
+                        << llvm::sys::path::filename(Inc->Spelled,
+                                                     llvm::sys::path::Style::posix)
+                        << FixItHint::CreateRemoval(CharSourceRange::getCharRange(
+                            SM->translateLineCol(SM->getMainFileID(), Inc->Line, 1),
+                            SM->translateLineCol(SM->getMainFileID(), Inc->Line + 1, 1)));
+            }
+        }
+        else {
+            llvm::outs()
+                    << "Skipping include cleaner header removal due to the SkipRemove\n";
         }
     }
 } // namespace clang::tidy::misc
