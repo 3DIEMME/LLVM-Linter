@@ -65,6 +65,39 @@ public:
     EndIfs[IfLoc] = Loc;
   }
 
+  void PragmaDirective(SourceLocation Loc,
+                       PragmaIntroducerKind Introducer) override {
+    SourceManager &SM = PP->getSourceManager();
+    if (OptionalFileEntryRef FE = SM.getFileEntryRefForID(SM.getFileID(Loc))) {
+      std::string FileName = cleanPath(FE->getName());
+
+      if (!Files.contains(FileName)) {
+        return;
+      }
+    }
+
+    // Convert to a spelling location to handle macro expansions
+    clang::SourceLocation SpellingLoc = SM.getSpellingLoc(Loc);
+
+    // Get the line number and extract the line of text
+    auto [fst, snd] = SM.getDecomposedLoc(SpellingLoc);
+    clang::StringRef LineText = SM.getBufferData(fst);
+
+    // Extract the line itself
+    const char *LineStart = LineText.data() + SM.getFileOffset(SpellingLoc);
+    const char *LineEnd = LineStart;
+    while (*LineEnd != '\n' && *LineEnd != '\r' && *LineEnd != '\0')
+      LineEnd++;
+    clang::StringRef PragmaLine(LineStart, LineEnd - LineStart);
+
+    if (PragmaLine.trim().equals("#pragma once")) {
+      if (OptionalFileEntryRef FE = SM.getFileEntryRefForID(fst)) {
+        std::string FileName = cleanPath(FE->getName());
+        PragmaOncedFiles[FileName] = *FE;
+      }
+    }
+  }
+
   void EndOfMainFile() override {
     // Now that we have all this information from the preprocessor, use it!
     SourceManager &SM = PP->getSourceManager();
@@ -94,28 +127,38 @@ public:
       SourceLocation EndIf =
           EndIfs[Ifndefs[MacroEntry.first.getIdentifierInfo()].first];
 
-      // If the macro Name is not equal to what we can compute, correct it in
-      // the #ifndef and #define.
+      std::vector<FixItHint> FixIts;
       StringRef CurHeaderGuard =
           MacroEntry.first.getIdentifierInfo()->getName();
-      std::vector<FixItHint> FixIts;
-      std::string NewGuard = checkHeaderGuardDefinition(
-          Ifndef, Define, EndIf, FileName, CurHeaderGuard, FixIts);
-
-      // Now look at the #endif. We want a comment with the header guard. Fix it
-      // at the slightest deviation.
-      checkEndifComment(FileName, EndIf, NewGuard, FixIts);
-
-      // Bundle all fix-its into one warning. The message depends on whether we
-      // changed the header guard or not.
-      if (!FixIts.empty()) {
-        if (CurHeaderGuard != NewGuard) {
-          Check->diag(Ifndef, "header guard does not follow preferred style")
+      if (Check->shouldUsePragmaOnce()) {
+        checkPragmaOnceDefinition(Ifndef, Define, EndIf, CurHeaderGuard,
+                                  FixIts);
+        if (!FixIts.empty()) {
+          Check->diag(Ifndef,
+                      "header guard should be replaced with #pragma once")
               << FixIts;
-        } else {
-          Check->diag(EndIf, "#endif for a header guard should reference the "
-                             "guard macro in a comment")
-              << FixIts;
+        }
+      } else {
+        // If the macro Name is not equal to what we can compute, correct it in
+        // the #ifndef and #define.
+        std::string NewGuard = checkHeaderGuardDefinition(
+            Ifndef, Define, EndIf, FileName, CurHeaderGuard, FixIts);
+
+        // Now look at the #endif. We want a comment with the header guard. Fix
+        // it at the slightest deviation.
+        checkEndifComment(FileName, EndIf, NewGuard, FixIts);
+
+        // Bundle all fix-its into one warning. The message depends on whether
+        // we changed the header guard or not.
+        if (!FixIts.empty()) {
+          if (CurHeaderGuard != NewGuard) {
+            Check->diag(Ifndef, "header guard does not follow preferred style")
+                << FixIts;
+          } else {
+            Check->diag(EndIf, "#endif for a header guard should reference the "
+                               "guard macro in a comment")
+                << FixIts;
+          }
         }
       }
     }
@@ -151,6 +194,58 @@ public:
       return Check->shouldSuggestEndifComment(FileName);
 
     return EndIfStr.trim() != HeaderGuard;
+  }
+
+  int getLineNumber(clang::SourceLocation loc) {
+    SourceManager &SM = PP->getSourceManager();
+    if (loc.isValid()) {
+      if (loc.isMacroID()) {
+        return SM.getPresumedLineNumber(SM.getExpansionLoc(loc));
+      }
+      return SM.getPresumedLineNumber(loc);
+    }
+    return -1;
+  }
+
+  clang::SourceRange getLineRange(int line, clang::SourceManager &sm,
+                                  clang::FileID fileId) {
+    // Get the start of the given line
+    clang::SourceLocation startLoc = sm.translateLineCol(fileId, line, 1);
+
+    // Try to get the start of the next line
+    clang::SourceLocation endLoc = sm.translateLineCol(fileId, line + 1, 1);
+
+    // If getting the start of the next line fails, assume end of the file
+    if (endLoc.isInvalid()) {
+      clang::SourceLocation lastLoc = sm.getLocForEndOfFile(fileId);
+      endLoc = lastLoc.isValid() ? lastLoc : startLoc;
+    } else {
+      // Step back one character to stay on the current line
+      endLoc = endLoc.getLocWithOffset(-1);
+    }
+
+    return clang::SourceRange(startLoc, endLoc);
+  }
+
+  void checkPragmaOnceDefinition(SourceLocation Ifndef, SourceLocation Define,
+                                 SourceLocation EndIf, StringRef CurHeaderGuard,
+                                 std::vector<FixItHint> &FixIts) {
+
+    if (Ifndef.isValid()) {
+      FixIts.push_back(FixItHint::CreateReplacement(
+          CharSourceRange::getTokenRange(
+              Ifndef.getLocWithOffset(-8),
+              Ifndef.getLocWithOffset(CurHeaderGuard.size())),
+          "#pragma once"));
+      FixIts.push_back(FixItHint::CreateRemoval(CharSourceRange::getTokenRange(
+          Define.getLocWithOffset(-8),
+          Define.getLocWithOffset(CurHeaderGuard.size()))));
+
+      const char *EndIfData = PP->getSourceManager().getCharacterData(EndIf);
+      size_t EndIfLen = std::strcspn(EndIfData, "\r\n");
+      FixIts.push_back(FixItHint::CreateRemoval(CharSourceRange::getTokenRange(
+          EndIf.getLocWithOffset(-4), EndIf.getLocWithOffset(EndIfLen))));
+    }
   }
 
   /// Look for header guards that don't match the preferred style. Emit
@@ -203,8 +298,12 @@ public:
   void checkGuardlessHeaders() {
     // Look for header files that didn't have a header guard. Emit a warning and
     // fix-its to add the guard.
-    // TODO: Insert the guard after top comments.
     for (const auto &FE : Files) {
+      if (Check->shouldUsePragmaOnce() &&
+          PragmaOncedFiles.contains(FE.getKey())) {
+        continue;
+      }
+
       StringRef FileName = FE.getKey();
       if (!Check->shouldSuggestToAddHeaderGuard(FileName))
         continue;
@@ -239,14 +338,20 @@ public:
       if (SeenMacro)
         continue;
 
-      Check->diag(StartLoc, "header is missing header guard")
-          << FixItHint::CreateInsertion(
-                 StartLoc, "#ifndef " + CPPVar + "\n#define " + CPPVar + "\n\n")
-          << FixItHint::CreateInsertion(
-                 SM.getLocForEndOfFile(FID),
-                 Check->shouldSuggestEndifComment(FileName)
-                     ? "\n#" + Check->formatEndIf(CPPVar) + "\n"
-                     : "\n#endif\n");
+      if (Check->shouldUsePragmaOnce()) {
+        Check->diag(StartLoc, "header is missing \"#pragma once\" header guard")
+            << FixItHint::CreateInsertion(StartLoc, "#pragma once\n");
+      } else {
+        Check->diag(StartLoc, "header is missing header guard")
+            << FixItHint::CreateInsertion(StartLoc, "#ifndef " + CPPVar +
+                                                        "\n#define " + CPPVar +
+                                                        "\n\n")
+            << FixItHint::CreateInsertion(
+                   SM.getLocForEndOfFile(FID),
+                   Check->shouldSuggestEndifComment(FileName)
+                       ? "\n#" + Check->formatEndIf(CPPVar) + "\n"
+                       : "\n#endif\n");
+      }
     }
   }
 
@@ -260,6 +365,7 @@ private:
 
   std::vector<std::pair<Token, const MacroInfo *>> Macros;
   llvm::StringMap<const FileEntry *> Files;
+  llvm::StringMap<const FileEntry *> PragmaOncedFiles;
   std::map<const IdentifierInfo *, std::pair<SourceLocation, SourceLocation>>
       Ifndefs;
   std::map<SourceLocation, SourceLocation> EndIfs;
@@ -271,6 +377,7 @@ private:
 
 void HeaderGuardCheck::storeOptions(ClangTidyOptions::OptionMap &Opts) {
   Options.store(Opts, "HeaderFileExtensions", RawStringHeaderFileExtensions);
+  Options.store(Opts, "UsePragmaOnce", UsePragmaOnce);
 }
 
 void HeaderGuardCheck::registerPPCallbacks(const SourceManager &SM,
@@ -297,4 +404,5 @@ bool HeaderGuardCheck::shouldSuggestToAddHeaderGuard(StringRef FileName) {
 std::string HeaderGuardCheck::formatEndIf(StringRef HeaderGuard) {
   return "endif // " + HeaderGuard.str();
 }
+bool HeaderGuardCheck::shouldUsePragmaOnce() { return UsePragmaOnce; }
 } // namespace clang::tidy::utils

@@ -39,6 +39,11 @@ public:
       }
     } else
       HeaderFileExtensions = Context->getHeaderFileExtensions();
+
+    std::optional<StringRef> UsePragmaOnceOption = Options.get("UsePragmaOnce");
+    if(UsePragmaOnceOption && UsePragmaOnceOption->equals("true")) {
+      this->UsePragmaOnce = true;
+    }
   }
   void storeOptions(ClangTidyOptions::OptionMap &Opts) override;
   void registerPPCallbacks(const SourceManager &SM, Preprocessor *PP,
@@ -63,10 +68,11 @@ public:
   /// Gets the canonical header guard for a file.
   virtual std::string getHeaderGuard(StringRef Filename,
                                      StringRef OldGuard = StringRef()) = 0;
-
+  virtual bool shouldUsePragmaOnce();
 private:
   std::string RawStringHeaderFileExtensions;
   FileExtensionsSet HeaderFileExtensions;
+  bool UsePragmaOnce{false};
 };
 
 } // namespace clang::tidy::utils
