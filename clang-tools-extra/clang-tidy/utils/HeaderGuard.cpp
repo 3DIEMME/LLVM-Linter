@@ -359,6 +359,7 @@ private:
   void clearAllState() {
     Macros.clear();
     Files.clear();
+    PragmaOncedFiles.clear();
     Ifndefs.clear();
     EndIfs.clear();
   }
