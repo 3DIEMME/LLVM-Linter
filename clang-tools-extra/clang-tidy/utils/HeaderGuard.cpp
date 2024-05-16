@@ -235,11 +235,8 @@ public:
       FixIts.push_back(FixItHint::CreateReplacement(
           CharSourceRange::getTokenRange(
               Ifndef.getLocWithOffset(-8),
-              Ifndef.getLocWithOffset(CurHeaderGuard.size())),
+              Define.getLocWithOffset(CurHeaderGuard.size())),
           "#pragma once"));
-      FixIts.push_back(FixItHint::CreateRemoval(CharSourceRange::getTokenRange(
-          Define.getLocWithOffset(-8),
-          Define.getLocWithOffset(CurHeaderGuard.size()))));
 
       const char *EndIfData = PP->getSourceManager().getCharacterData(EndIf);
       size_t EndIfLen = std::strcspn(EndIfData, "\r\n");
