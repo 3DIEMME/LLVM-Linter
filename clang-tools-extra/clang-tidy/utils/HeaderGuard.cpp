@@ -241,7 +241,7 @@ public:
       const char *EndIfData = PP->getSourceManager().getCharacterData(EndIf);
       size_t EndIfLen = std::strcspn(EndIfData, "\r\n");
       FixIts.push_back(FixItHint::CreateRemoval(CharSourceRange::getTokenRange(
-          EndIf.getLocWithOffset(-4), EndIf.getLocWithOffset(EndIfLen))));
+          EndIf.getLocWithOffset(-2), EndIf.getLocWithOffset(EndIfLen))));
     }
   }
 
