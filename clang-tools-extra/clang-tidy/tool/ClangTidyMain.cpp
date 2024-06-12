@@ -26,6 +26,7 @@
 #include "llvm/Support/Signals.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/WithColor.h"
+#include <algorithm>
 #include <optional>
 
 using namespace clang::tooling;
@@ -166,6 +167,13 @@ attached fix-its, clang-tidy will apply them as
 well.
 )"),
                                cl::init(false), cl::cat(ClangTidyCategory));
+
+static cl::opt<bool> SkipErrors("skip-errors", desc(R"(
+Apply suggested fixes even if compilation
+errors were found. If compiler errors have
+attached fix-its, clang-tidy will ignore them.
+)"),
+                                cl::init(false), cl::cat(ClangTidyCategory));
 
 static cl::opt<bool> FixNotes("fix-notes", desc(R"(
 If a warning has no fix, but a single fix can
@@ -340,8 +348,8 @@ static void printStats(const ClangTidyStats &Stats) {
   }
 }
 
-static std::unique_ptr<ClangTidyOptionsProvider> createOptionsProvider(
-   llvm::IntrusiveRefCntPtr<vfs::FileSystem> FS) {
+static std::unique_ptr<ClangTidyOptionsProvider>
+createOptionsProvider(llvm::IntrusiveRefCntPtr<vfs::FileSystem> FS) {
   ClangTidyGlobalOptions GlobalOptions;
   if (std::error_code Err = parseLineFilter(LineFilter, GlobalOptions)) {
     llvm::errs() << "Invalid LineFilter: " << Err.message() << "\n\nUsage:\n";
@@ -680,6 +688,17 @@ int clangTidyMain(int argc, const char **argv) {
   std::vector<ClangTidyError> Errors =
       runClangTidy(Context, OptionsParser->getCompilations(), PathList, BaseFS,
                    FixNotes, EnableCheckProfile, ProfilePrefix);
+
+  // Filter out the compiler errors if specified
+  if (SkipErrors) {
+    std::ignore = Errors.erase(std::remove_if(Errors.begin(), Errors.end(),
+                                              [](const ClangTidyError &E) {
+                                                return E.DiagLevel ==
+                                                       ClangTidyError::Error;
+                                              }),
+                               Errors.end());
+  }
+
   bool FoundErrors = llvm::any_of(Errors, [](const ClangTidyError &E) {
     return E.DiagLevel == ClangTidyError::Error;
   });
